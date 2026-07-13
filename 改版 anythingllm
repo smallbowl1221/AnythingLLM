@@ -1,0 +1,149 @@
+# 重建 docker image
+cd /home/jeff/anything-llm
+docker build -f docker/Dockerfile -t ntuai/anythingllm:v1.1.0 \
+  --network=host \
+  .
+
+
+  sudo chown -R 1000:1000 /home/jeff/ntu_ai_portal-3004
+---
+
+# 重新 deploy
+
+0. 權限修正（必做，否則預設 run 會一直 Restarting）
+# 為什麼會壞掉：entrypoint 同時跑 server + collector，用 wait -n（任一個先掛整台就關）。
+# 實際是先掛的是 server：寫入 DB 或 storage/comkey 時權限不足（read-only / EACCES），
+# server 一崩潰容器就跟著退出了，collector 沒壞，是陪葬。
+# 在 aiweb 上執行一次，讓容器 uid 1000 能寫入儲存目錄：
+# sudo chown -R 1000:1000 /home/jeff/ntu_ai_portal-re\
+sudo chown -R 1000:1000 /home/jeff/ntu_ai_portal-re
+
+1. docker run 指令（host 網路 + port 3004）
+# 儲存路徑：既有目錄 /home/jeff/ntu_ai_portal-re
+# 已改 docker-entrypoint.sh：collector 背景、server 前景，用預設 entrypoint 才不會 Restarting。改過後需重建 image（見最上方）。
+
+docker stop anythingllm && docker rm anythingllm
+docker stop anythingllm
+docker rm anythingllm
+
+docker run -d \
+  --name ntuai-anythingllm \
+  --network host \
+  --restart unless-stopped \
+  --env-file /home/jeff/ntu_ai_portal-3004/.env \
+  -v "/home/jeff/ntu_ai_portal-3004":/app/server/storage \
+  -e STORAGE_DIR=/app/server/storage \
+  -e SERVER_PORT=3001 \
+  --cap-add SYS_ADMIN \
+  ntuai/anythingllm:v1.1.0
+
+# --- 第二個服務：library（專用 network + 對外 3004）---
+# 專用 bridge：與預設 bridge / 其他 compose 隔開，日後同網段可加 sidecar。只需建立一次：
+docker network create ntuai-anythingllm-library-net 2>/dev/null || true
+# 若連內網 Ollama (192.168.99.111:11434) 仍不通，改 --network host + SERVER_PORT=3004（見前文）
+# 請用獨立目錄，勿與 ntu_ai_portal-3004 共用 storage
+sudo mkdir -p /home/jeff/ntu_ai_portal-library
+sudo chown -R 1000:1000 /home/jeff/ntu_ai_portal-library
+# .env：Ollama Base URL http://192.168.99.111:11434
+docker stop ntuai-anythingllm-library 2>/dev/null; docker rm ntuai-anythingllm-library 2>/dev/null
+docker run -d \
+  --name ntuai-anythingllm-library \
+  --network ntuai-anythingllm-library-net \
+  --restart unless-stopped \
+  -p 3004:3001 \
+  --env-file /home/jeff/ntu_ai_portal-library/.env \
+  -v "/home/jeff/ntu_ai_portal-library":/app/server/storage \
+  -e STORAGE_DIR=/app/server/storage \
+  -e SERVER_PORT=3001 \
+  --cap-add SYS_ADMIN \
+  ntuai/anythingllm:v1.1.0
+
+export STORAGE_LOCATION=$HOME/anythingllm-local && \
+mkdir -p $STORAGE_LOCATION && \
+touch "$STORAGE_LOCATION/.env" && \
+docker run -d -p 3004:3001 \
+--cap-add SYS_ADMIN \
+-v ${STORAGE_LOCATION}:/app/server/storage \
+-v ${STORAGE_LOCATION}/.env:/app/server/.env \
+-e STORAGE_DIR="/app/server/storage" \
+anythingllm-local:latest
+
+docker run -d \
+  --name anythingllm \
+  --network host \
+  --restart unless-stopped \
+  --env-file /home/jeff/ntu_ai_portal-3004/.env \
+  -v "/home/jeff/ntu_ai_portal-3004":/app/server/storage \
+  -e STORAGE_DIR=/app/server/storage \
+  -e SERVER_PORT=3004 \
+  --cap-add SYS_ADMIN \
+  anythingllm-local:latest
+
+1b. 若上面一直 Restarting：只跑 server（不跑 collector），容器可穩定常駐
+docker stop anythingllm 2>/dev/null; docker rm anythingllm 2>/dev/null
+docker run -d \
+  --name anythingllm \
+  --network host \
+  --restart unless-stopped \
+  --env-file /home/jeff/anything-llm/docker/.env \
+  -v "/home/jeff/ntu_ai_portal-re":/app/server/storage \
+  -e STORAGE_DIR=/app/server/storage \
+  --cap-add SYS_ADMIN \
+  --entrypoint /bin/bash \
+  anythingllm-local:latest \
+  -c "cd /app/server && npx prisma generate --schema=./prisma/schema.prisma && npx prisma migrate deploy --schema=./prisma/schema.prisma && node index.js"
+
+2. docker/.env 要設的內容
+服務對外 port 3004（host 模式時直接聽主機的 3004）：
+SERVER_PORT=3004
+
+---
+
+# 上傳檔案失敗時追 log（已改 collectorApi 會印出 collector 回傳的 status 與 body）
+# 重建 image 後再上傳一次，然後執行：
+# docker logs anythingllm 2>&1 | grep -A2 "collector /process failed"
+
+# 除錯 A：前景跑只看 server（不加 -d），錯誤直接印在終端
+docker run --rm \
+  --network host \
+  --env-file /home/jeff/anything-llm/docker/.env \
+  -v "/home/jeff/ntu_ai_portal-re":/app/server/storage \
+  -e STORAGE_DIR=/app/server/storage \
+  --entrypoint /bin/bash \
+  anythingllm-local:latest \
+  -c "cd /app/server && npx prisma generate --schema=./prisma/schema.prisma && npx prisma migrate deploy --schema=./prisma/schema.prisma && node index.js"
+
+# 除錯 B：追蹤 log（collector 背景、server 前景，server 崩潰時錯誤會出現在 docker logs）
+docker stop anythingllm 2>/dev/null; docker rm anythingllm 2>/dev/null
+docker run -d \
+  --name anythingllm \
+  --network host \
+  --restart unless-stopped \
+  --env-file /home/jeff/anything-llm/docker/.env \
+  -v "/home/jeff/ntu_ai_portal-re":/app/server/storage \
+  -e STORAGE_DIR=/app/server/storage \
+  --cap-add SYS_ADMIN \
+  --entrypoint /bin/bash \
+  anythingllm-local:latest \
+  -c "(node /app/collector/index.js 2>&1) & cd /app/server && export CHECKPOINT_DISABLE=1 && npx prisma generate --schema=./prisma/schema.prisma && npx prisma migrate deploy --schema=./prisma/schema.prisma && node index.js 2>&1"
+# 等幾秒後看 log（server 為前景 process，崩潰訊息會在這裡）：
+docker logs anythingllm 2>&1
+
+---
+
+    docker build -f docker/Dockerfile -t anythingllm-3004:v1 --network=host .
+
+docker stop anythingllm-3004 && docker rm anythingllm-3004
+
+export STORAGE_LOCATION=/home/jeff/ntu_ai_portal-3004
+
+docker run -d \
+  --name anythingllm-3004 \
+  --network host \
+  --restart unless-stopped \
+  -v "${STORAGE_LOCATION}:/app/server/storage" \
+  -v "${STORAGE_LOCATION}/.env:/app/server/.env" \
+  -e STORAGE_DIR="/app/server/storage" \
+  -e SERVER_PORT=3004 \
+  --cap-add SYS_ADMIN \
+  anythingllm-3004:v1

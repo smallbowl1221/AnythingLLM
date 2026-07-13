@@ -1,0 +1,16 @@
+docker build -f docker/Dockerfile -t ntuai/anythingllm:v1.1.2 .
+
+docker run -d --name ntuai-anythingllm \
+  -p 3001:3001 \
+  --restart unless-stopped \
+  -v "/Users/lch/Program/anythingLLM/ntu_ai_portal/.env":/app/server/.env \
+  -v "/Users/lch/Program/anythingLLM/ntu_ai_portal":/app/server/storage \
+  -e STORAGE_DIR=/app/server/storage \
+  -e SERVER_PORT=3001 \
+  --cap-add SYS_ADMIN \
+  ntuai/anythingllm:v1.1.2
+
+
+docker stop ntuai-anythingllm && docker rm ntuai-anythingllm
+
+--network host

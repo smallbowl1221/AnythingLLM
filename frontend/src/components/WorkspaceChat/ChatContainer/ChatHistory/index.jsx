@@ -1,0 +1,324 @@
+import {
+  useEffect,
+  useRef,
+  useState,
+  useMemo,
+  useCallback,
+  forwardRef,
+} from "react";
+import HistoricalMessage from "./HistoricalMessage";
+import PromptReply from "./PromptReply";
+import StatusResponse from "./StatusResponse";
+import { useManageWorkspaceModal } from "../../../Modals/ManageWorkspace";
+import ManageWorkspace from "../../../Modals/ManageWorkspace";
+import { ArrowDown } from "@phosphor-icons/react";
+import debounce from "lodash.debounce";
+import Chartable from "./Chartable";
+import Workspace from "@/models/workspace";
+import { useParams } from "react-router-dom";
+import paths from "@/utils/paths";
+import Appearance from "@/models/appearance";
+import useTextSize from "@/hooks/useTextSize";
+import useChatHistoryScrollHandle from "@/hooks/useChatHistoryScrollHandle";
+import { ThoughtExpansionProvider } from "./ThoughtContainer";
+
+export default forwardRef(function (
+  {
+    history = [],
+    workspace,
+    sendCommand,
+    updateHistory,
+    regenerateAssistantMessage,
+  },
+  ref
+) {
+  const lastScrollTopRef = useRef(0);
+  const chatHistoryRef = useRef(null);
+  const { threadSlug = null } = useParams();
+  const { showing, hideModal } = useManageWorkspaceModal();
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [isUserScrolling, setIsUserScrolling] = useState(false);
+  const isStreaming = history[history.length - 1]?.animate;
+  const { showScrollbar } = Appearance.getSettings();
+  const { textSizeClass } = useTextSize();
+
+  useEffect(() => {
+    if (!isUserScrolling && (isAtBottom || isStreaming)) {
+      scrollToBottom(false); // Use instant scroll for auto-scrolling
+    }
+  }, [history, isAtBottom, isStreaming, isUserScrolling]);
+
+  const handleScroll = (e) => {
+    const { scrollTop, scrollHeight, clientHeight } = e.target;
+    const isBottom = scrollHeight - scrollTop - clientHeight < 2;
+
+    // Detect if this is a user-initiated scroll
+    if (Math.abs(scrollTop - lastScrollTopRef.current) > 10) {
+      setIsUserScrolling(!isBottom);
+    }
+
+    setIsAtBottom(isBottom);
+    lastScrollTopRef.current = scrollTop;
+  };
+
+  const debouncedScroll = debounce(handleScroll, 100);
+
+  useEffect(() => {
+    const chatHistoryElement = chatHistoryRef.current;
+    if (chatHistoryElement) {
+      chatHistoryElement.addEventListener("scroll", debouncedScroll);
+      return () =>
+        chatHistoryElement.removeEventListener("scroll", debouncedScroll);
+    }
+  }, []);
+
+  const scrollToBottom = (smooth = false) => {
+    if (chatHistoryRef.current) {
+      chatHistoryRef.current.scrollTo({
+        top: chatHistoryRef.current.scrollHeight,
+
+        // Smooth is on when user clicks the button but disabled during auto scroll
+        // We must disable this during auto scroll because it causes issues with
+        // detecting when we are at the bottom of the chat.
+        ...(smooth ? { behavior: "smooth" } : {}),
+      });
+    }
+  };
+
+  useChatHistoryScrollHandle(ref, chatHistoryRef, {
+    setIsUserScrolling,
+    isStreaming,
+    scrollToBottom,
+  });
+
+  const saveEditedMessage = async ({
+    editedMessage,
+    chatId,
+    role,
+    attachments = [],
+    saveOnly = false,
+  }) => {
+    if (!editedMessage) return; // Don't save empty edits.
+
+    // "Save" on a user message: update the prompt text without regenerating
+    if (role === "user" && saveOnly) {
+      const updatedHistory = [...history];
+      const targetIdx = history.findIndex((msg) => msg.chatId === chatId);
+      if (targetIdx < 0) return;
+      updatedHistory[targetIdx].content = editedMessage;
+      updateHistory(updatedHistory);
+      await Workspace.updateChat(
+        workspace.slug,
+        threadSlug,
+        chatId,
+        editedMessage,
+        "user"
+      );
+      return;
+    }
+
+    // "Submit" on a user message: auto-regenerate the response and delete all
+    // messages post modified message
+    if (role === "user") {
+      // remove all messages after the edited message
+      // technically there are two chatIds per-message pair, this will split the first.
+      const updatedHistory = history.slice(
+        0,
+        history.findIndex((msg) => msg.chatId === chatId) + 1
+      );
+
+      // update last message in history to edited message
+      updatedHistory[updatedHistory.length - 1].content = editedMessage;
+      // remove all edited messages after the edited message in backend
+      await Workspace.deleteEditedChats(workspace.slug, threadSlug, chatId);
+      sendCommand({
+        text: editedMessage,
+        autoSubmit: true,
+        history: updatedHistory,
+        attachments,
+      });
+      return;
+    }
+
+    // If role is an assistant we simply want to update the comment and save on the backend as an edit.
+    if (role === "assistant") {
+      const updatedHistory = [...history];
+      const targetIdx = history.findIndex(
+        (msg) => msg.chatId === chatId && msg.role === role
+      );
+      if (targetIdx < 0) return;
+      updatedHistory[targetIdx].content = editedMessage;
+      updateHistory(updatedHistory);
+      await Workspace.updateChat(
+        workspace.slug,
+        threadSlug,
+        chatId,
+        editedMessage
+      );
+      return;
+    }
+  };
+
+  const forkThread = async (chatId) => {
+    const newThreadSlug = await Workspace.forkThread(
+      workspace.slug,
+      threadSlug,
+      chatId
+    );
+    window.location.href = paths.workspace.thread(
+      workspace.slug,
+      newThreadSlug
+    );
+  };
+
+  const compiledHistory = useMemo(
+    () =>
+      buildMessages({
+        workspace,
+        history,
+        regenerateAssistantMessage,
+        saveEditedMessage,
+        forkThread,
+      }),
+    [
+      workspace,
+      history,
+      regenerateAssistantMessage,
+      saveEditedMessage,
+      forkThread,
+    ]
+  );
+  const lastMessageInfo = useMemo(() => getLastMessageInfo(history), [history]);
+  const renderStatusResponse = useCallback(
+    (item, index) => {
+      const hasSubsequentMessages = index < compiledHistory.length - 1;
+      return (
+        <StatusResponse
+          key={`status-group-${index}`}
+          messages={item}
+          isThinking={!hasSubsequentMessages && lastMessageInfo.isAnimating}
+        />
+      );
+    },
+    [compiledHistory.length, lastMessageInfo]
+  );
+
+  return (
+    <ThoughtExpansionProvider>
+      <div
+        className={`markdown text-white/80 light:text-theme-text-primary font-light ${textSizeClass} h-full md:h-[83%] pb-[100px] pt-6 md:pt-0 md:pb-20 md:mx-0 overflow-y-scroll flex flex-col items-center justify-start ${showScrollbar ? "show-scrollbar" : "no-scroll"}`}
+        id="chat-history"
+        ref={chatHistoryRef}
+        onScroll={handleScroll}
+      >
+        <div className="w-full max-w-[750px]">
+          {compiledHistory.map((item, index) =>
+            Array.isArray(item) ? renderStatusResponse(item, index) : item
+          )}
+        </div>
+        {showing && (
+          <ManageWorkspace
+            hideModal={hideModal}
+            providedSlug={workspace.slug}
+          />
+        )}
+      </div>
+      {!isAtBottom && (
+        <div className="absolute bottom-40 right-10 z-50 cursor-pointer animate-pulse">
+          <div className="flex flex-col items-center">
+            <div
+              className="p-1 rounded-full border border-white/10 bg-white/10 hover:bg-white/20 hover:text-white"
+              onClick={() => {
+                scrollToBottom(isStreaming ? false : true);
+                setIsUserScrolling(false);
+              }}
+            >
+              <ArrowDown weight="bold" className="text-white/60 w-5 h-5" />
+            </div>
+          </div>
+        </div>
+      )}
+    </ThoughtExpansionProvider>
+  );
+});
+
+const getLastMessageInfo = (history) => {
+  const lastMessage = history?.[history.length - 1] || {};
+  return {
+    isAnimating: lastMessage?.animate,
+    isStatusResponse: lastMessage?.type === "statusResponse",
+  };
+};
+
+/**
+ * Builds the history of messages for the chat.
+ * This is mostly useful for rendering the history in a way that is easy to understand.
+ * as well as compensating for agent thinking and other messages that are not part of the history, but
+ * are still part of the chat.
+ *
+ * @param {Object} param0 - The parameters for building the messages.
+ * @param {Array} param0.history - The history of messages.
+ * @param {Object} param0.workspace - The workspace object.
+ * @param {Function} param0.regenerateAssistantMessage - The function to regenerate the assistant message.
+ * @param {Function} param0.saveEditedMessage - The function to save the edited message.
+ * @param {Function} param0.forkThread - The function to fork the thread.
+ * @returns {Array} The compiled history of messages.
+ */
+function buildMessages({
+  history,
+  workspace,
+  regenerateAssistantMessage,
+  saveEditedMessage,
+  forkThread,
+}) {
+  return history.reduce((acc, props, index) => {
+    const isLastBotReply =
+      index === history.length - 1 && props.role === "assistant";
+
+    if (props?.type === "statusResponse" && !!props.content) {
+      if (acc.length > 0 && Array.isArray(acc[acc.length - 1])) {
+        acc[acc.length - 1].push(props);
+      } else {
+        acc.push([props]);
+      }
+      return acc;
+    }
+
+    if (props.type === "rechartVisualize" && !!props.content) {
+      acc.push(<Chartable key={props.uuid} props={props} />);
+    } else if (isLastBotReply && props.animate) {
+      acc.push(
+        <PromptReply
+          key={`prompt-reply-${props.uuid || index}`}
+          uuid={props.uuid}
+          reply={props.content}
+          pending={props.pending}
+          sources={props.sources}
+          error={props.error}
+          closed={props.closed}
+        />
+      );
+    } else {
+      acc.push(
+        <HistoricalMessage
+          key={index}
+          uuid={props.uuid}
+          message={props.content}
+          role={props.role}
+          workspace={workspace}
+          sources={props.sources}
+          feedbackScore={props.feedbackScore}
+          chatId={props.chatId}
+          error={props.error}
+          attachments={props.attachments}
+          regenerateMessage={regenerateAssistantMessage}
+          isLastMessage={isLastBotReply}
+          saveEditedMessage={saveEditedMessage}
+          forkThread={forkThread}
+          metrics={props.metrics}
+        />
+      );
+    }
+    return acc;
+  }, []);
+}
